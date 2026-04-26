@@ -39,6 +39,8 @@ from sandbox.utils.mounted_oj import (
     VERDICT_AC,
     VERDICT_ERROR,
     judge_cases_from_disk,
+    run_generator_from_paths,
+    run_solution_cases_from_dir,
     resolve_data_root,
     resolve_generation_data_root,
     run_program_from_disk,
@@ -185,6 +187,62 @@ class RunMountedProgramResponse(RunCodeResponse):
     problem_id: str
     data_dir: str
     saved_stdout_path: Optional[str] = None
+
+
+class RunGeneratorRequest(BaseModel):
+    generator_path: str = Field(..., description='absolute path to generator.cpp under the mounted generation root')
+    testlib_path: str = Field(..., description='absolute path to testlib.h')
+    argv: List[str] = Field(default_factory=list, description='argv passed to the generator binary')
+    output_path: str = Field(..., description='absolute path where generator stdout should be persisted')
+    compile_timeout: float = Field(30, description='compile timeout in seconds')
+    run_timeout: float = Field(30, description='run timeout in seconds')
+    memory_limit_MB: int = Field(-1, description='maximum memory allowed in megabytes')
+    data_dir: Optional[str] = Field(None, description='optional override for the mounted generation data root')
+
+
+class RunGeneratorExecInfo(BaseModel):
+    compile_result: Optional[CommandRunResult] = None
+    run_result: Optional[CommandRunResult] = None
+
+
+class RunGeneratorResponse(BaseModel):
+    success: bool
+    output: str = ''
+    error: str = ''
+    exec_info: RunGeneratorExecInfo = Field(default_factory=RunGeneratorExecInfo)
+    executor_pod_name: Optional[str] = None
+
+
+class RunSolutionCaseResponse(BaseModel):
+    case_id: str
+    success: bool
+    output: str = ''
+    error: str = ''
+    run_result: Optional[CommandRunResult] = None
+
+
+class RunSolutionRequest(BaseModel):
+    code: str = Field(..., description='the submission source code')
+    language: Literal['cpp', 'java', 'py3', 'python'] = Field(
+        'cpp', description='supported languages: cpp, java, py3 (python alias accepted)'
+    )
+    input_path: str = Field(..., description='absolute path to the directory containing *.in files')
+    compile_timeout: float = Field(30, description='compile timeout in seconds')
+    run_timeout: float = Field(30, description='run timeout in seconds')
+    memory_limit_MB: int = Field(-1, description='maximum memory allowed in megabytes')
+    data_dir: Optional[str] = Field(None, description='optional override for the mounted generation data root')
+    enable_msvc_i64_compat: bool = Field(
+        False,
+        description='when true, rewrite legacy MSVC-style %I64* stdio format specifiers in cpp code',
+    )
+
+
+class RunSolutionResponse(BaseModel):
+    success: bool
+    compile_result: Optional[CommandRunResult] = None
+    cases: List[RunSolutionCaseResponse] = Field(default_factory=list)
+    error: str = ''
+    executor_pod_name: Optional[str] = None
 
 
 def _strip_case_details(case_results: List[MountedOJCaseResult]) -> List[MountedOJCaseResult]:
@@ -375,6 +433,102 @@ async def run_oj_cases(request: RunMountedOJRequest):
         logger.warning(message)
         resp.message = message
         resp.status = RunStatus.SandboxError
+
+    return resp
+
+
+@sandbox_router.post("/run_generator", response_model=RunGeneratorResponse, tags=['sandbox'])
+@max_concurrency(MOUNTED_OJ_MAX_CONCURRENCY)
+async def run_generator(request: RunGeneratorRequest):
+    resp = RunGeneratorResponse(
+        success=False,
+        output='',
+        error='',
+        executor_pod_name=os.environ.get('MY_POD_NAME'),
+    )
+    try:
+        data_root = resolve_generation_data_root(request.data_dir)
+        compile_result, run_result, output = await run_generator_from_paths(
+            data_root=data_root,
+            generator_path=request.generator_path,
+            testlib_path=request.testlib_path,
+            argv=request.argv,
+            output_path=request.output_path,
+            compile_timeout=request.compile_timeout,
+            run_timeout=request.run_timeout,
+            memory_limit_mb=request.memory_limit_MB,
+        )
+        resp.exec_info = RunGeneratorExecInfo(
+            compile_result=compile_result,
+            run_result=run_result,
+        )
+        compile_ok = (
+            compile_result is not None and
+            compile_result.status == CommandRunStatus.Finished and
+            compile_result.return_code == 0
+        )
+        run_ok = (
+            run_result is not None and
+            run_result.status == CommandRunStatus.Finished and
+            run_result.return_code == 0
+        )
+        resp.success = bool(compile_ok and run_ok)
+        resp.output = output
+        if not resp.success:
+            compile_err = compile_result.stderr if compile_result is not None else ''
+            run_err = run_result.stderr if run_result is not None else ''
+            parts = [part for part in [compile_err, run_err] if part]
+            resp.error = '; '.join(parts) if parts else 'generator execution failed'
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        message = f'exception on run_generator request {request.generator_path}: {e} {traceback.print_tb(e.__traceback__)}'
+        logger.warning(message)
+        resp.error = message
+
+    return resp
+
+
+@sandbox_router.post("/run_solution", response_model=RunSolutionResponse, tags=['sandbox'])
+@max_concurrency(MOUNTED_OJ_MAX_CONCURRENCY)
+async def run_solution(request: RunSolutionRequest):
+    resp = RunSolutionResponse(
+        success=False,
+        error='',
+        executor_pod_name=os.environ.get('MY_POD_NAME'),
+    )
+    try:
+        data_root = resolve_generation_data_root(request.data_dir)
+        compile_result, case_results = await run_solution_cases_from_dir(
+            data_root=data_root,
+            code=request.code,
+            language=request.language,
+            input_path=request.input_path,
+            compile_timeout=request.compile_timeout,
+            run_timeout=request.run_timeout,
+            memory_limit_mb=request.memory_limit_MB,
+            enable_msvc_i64_compat=request.enable_msvc_i64_compat,
+        )
+        resp.compile_result = compile_result
+        resp.cases = [RunSolutionCaseResponse(**case) for case in case_results]
+        compile_ok = (
+            compile_result is not None and
+            compile_result.status == CommandRunStatus.Finished and
+            compile_result.return_code == 0
+        )
+        resp.success = bool(compile_ok)
+        if not compile_ok:
+            resp.error = compile_result.stderr if compile_result is not None else 'solution compilation failed'
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        message = f'exception on run_solution request {request.input_path}: {e} {traceback.print_tb(e.__traceback__)}'
+        logger.warning(message)
+        resp.error = message
 
     return resp
 

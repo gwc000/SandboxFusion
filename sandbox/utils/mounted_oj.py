@@ -96,6 +96,33 @@ def _resolve_under(base_dir: Path, relative_path: str) -> Path:
     return candidate
 
 
+def _resolve_relative_subpath(base_dir: Path, relative_path: str, field_name: str) -> Path:
+    raw_path = (relative_path or '').strip()
+    if not raw_path:
+        raise ValueError(f'{field_name} must not be empty')
+    rel = Path(raw_path)
+    if rel.is_absolute():
+        raise ValueError(f'{field_name} must be relative: {relative_path!r}')
+    if any(part in {'', '.', '..'} for part in rel.parts):
+        raise ValueError(f'invalid {field_name}: {relative_path!r}')
+    return _resolve_under(base_dir, raw_path)
+
+
+def resolve_problem_dir(data_root: Path, problem_id: str) -> Path:
+    return _resolve_relative_subpath(data_root, problem_id, 'problem_id')
+
+
+def resolve_generation_file_path(data_root: Path, absolute_path: str, field_name: str) -> Path:
+    raw_path = (absolute_path or '').strip()
+    if not raw_path:
+        raise ValueError(f'{field_name} must not be empty')
+    candidate = Path(raw_path).expanduser().resolve()
+    root_resolved = data_root.resolve()
+    if candidate != root_resolved and root_resolved not in candidate.parents:
+        raise ValueError(f'{field_name} must be under generation data root: {candidate}')
+    return candidate
+
+
 def resolve_data_root(data_dir: Optional[str]) -> Path:
     root = data_dir or os.getenv('OJ_DATA_ROOT') or config.dataset.oj_data_root
     if not root:
@@ -114,8 +141,7 @@ def resolve_generation_data_root(data_dir: Optional[str]) -> Path:
 
 
 def load_problem_spec(data_root: Path, problem_id: str) -> Tuple[Path, MountedOJProblemSpec, Dict[str, MountedOJCaseSpec]]:
-    safe_problem_id = _validate_identifier(problem_id, 'problem_id')
-    problem_dir = _resolve_under(data_root, safe_problem_id)
+    problem_dir = resolve_problem_dir(data_root, problem_id)
     manifest_path = problem_dir / 'problem.json'
     if not manifest_path.is_file():
         raise FileNotFoundError(f'problem manifest not found: {manifest_path}')
@@ -123,9 +149,9 @@ def load_problem_spec(data_root: Path, problem_id: str) -> Tuple[Path, MountedOJ
     with open(manifest_path, 'r', encoding='utf-8') as f:
         problem = MountedOJProblemSpec(**json.load(f))
 
-    if problem.problem_id is not None and str(problem.problem_id) != safe_problem_id:
+    if problem.problem_id is not None and str(problem.problem_id) != str(problem_id):
         raise ValueError(
-            f'problem.json problem_id mismatch: expected {safe_problem_id!r}, got {problem.problem_id!r}')
+            f'problem.json problem_id mismatch: expected {problem_id!r}, got {problem.problem_id!r}')
 
     case_map = {}
     for case in problem.test_cases:
@@ -804,3 +830,135 @@ async def run_program_from_disk(
             encoded_files[rel_path] = base64.b64encode(resolved.read_bytes()).decode('utf-8')
 
         return problem, compile_result, run_result, encoded_files
+
+
+async def run_generator_from_paths(
+    data_root: Path,
+    generator_path: str,
+    testlib_path: str,
+    argv: List[str],
+    output_path: str,
+    compile_timeout: float,
+    run_timeout: float,
+    memory_limit_mb: int = -1,
+) -> tuple[Optional[CommandRunResult], Optional[CommandRunResult], str]:
+    resolved_generator_path = resolve_generation_file_path(data_root, generator_path, 'generator_path')
+    resolved_output_path = resolve_generation_file_path(data_root, output_path, 'output_path')
+    resolved_testlib_path = Path(testlib_path).expanduser().resolve()
+    if not resolved_generator_path.is_file():
+        raise FileNotFoundError(f'generator source not found: {resolved_generator_path}')
+    if not resolved_testlib_path.is_file():
+        raise FileNotFoundError(f'testlib.h not found: {resolved_testlib_path}')
+
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(dir=get_tmp_dir(), ignore_cleanup_errors=True) as tmp_dir_name:
+        work_dir = Path(tmp_dir_name)
+        local_generator_path = work_dir / 'generator.cpp'
+        local_generator_path.write_bytes(resolved_generator_path.read_bytes())
+        (work_dir / 'testlib.h').write_bytes(resolved_testlib_path.read_bytes())
+
+        compile_result = await _compile_cpp(
+            local_generator_path,
+            work_dir / 'gen',
+            compile_timeout,
+            work_dir,
+            memory_limit_mb=memory_limit_mb,
+            extra_flags=['-O2', '-DONLINE_JUDGE', f'-I{work_dir}'],
+        )
+        if compile_result.status != CommandRunStatus.Finished or compile_result.return_code != 0:
+            return compile_result, None, ''
+
+        stdin_path = work_dir / 'stdin.txt'
+        stdin_path.write_text('', encoding='utf-8')
+        stdout_path = work_dir / 'stdout.txt'
+        if stdout_path.exists():
+            stdout_path.unlink()
+
+        run_result = await _run_binary(
+            work_dir / 'gen',
+            work_dir,
+            stdin_path=stdin_path,
+            output_path=stdout_path,
+            timeout=run_timeout,
+            memory_limit_mb=memory_limit_mb,
+            cpu_limit_s=None,
+            argv=argv or [],
+        )
+
+        output_text = ''
+        if stdout_path.is_file():
+            output_bytes = stdout_path.read_bytes()
+            resolved_output_path.write_bytes(output_bytes)
+            output_text = output_bytes.decode('utf-8', errors='replace')
+
+        return compile_result, run_result, output_text
+
+
+async def run_solution_cases_from_dir(
+    data_root: Path,
+    code: str,
+    language: str,
+    input_path: str,
+    compile_timeout: float,
+    run_timeout: float,
+    memory_limit_mb: int = -1,
+    enable_msvc_i64_compat: bool = False,
+) -> tuple[Optional[CommandRunResult], List[Dict[str, object]]]:
+    resolved_input_dir = resolve_generation_file_path(data_root, input_path, 'input_path')
+    if not resolved_input_dir.is_dir():
+        raise FileNotFoundError(f'input_path is not a directory: {resolved_input_dir}')
+
+    case_files = sorted(
+        [path for path in resolved_input_dir.iterdir() if path.is_file() and path.suffix == '.in'],
+        key=lambda path: (not path.stem.isdigit(), int(path.stem) if path.stem.isdigit() else path.stem),
+    )
+    if not case_files:
+        raise FileNotFoundError(f'no .in files found under input_path: {resolved_input_dir}')
+
+    with tempfile.TemporaryDirectory(dir=get_tmp_dir(), ignore_cleanup_errors=True) as tmp_dir_name:
+        work_dir = Path(tmp_dir_name)
+        compile_result, solution_runner = await _prepare_solution_runner(
+            language=language,
+            code=code,
+            work_dir=work_dir,
+            compile_timeout=compile_timeout,
+            enable_msvc_i64_compat=enable_msvc_i64_compat,
+        )
+        if compile_result is not None and (
+            compile_result.status != CommandRunStatus.Finished or compile_result.return_code != 0
+        ):
+            return compile_result, []
+        if solution_runner is None:
+            return compile_result, []
+
+        case_results: List[Dict[str, object]] = []
+        for case_file in case_files:
+            output_path = work_dir / f'{case_file.stem}.stdout'
+            if output_path.exists():
+                output_path.unlink()
+            run_result = await solution_runner(
+                stdin_path=case_file,
+                output_path=output_path,
+                timeout=run_timeout,
+                memory_limit_mb=memory_limit_mb,
+                cpu_limit_s=None,
+            )
+            output_text = ''
+            if output_path.is_file():
+                output_text = output_path.read_text(encoding='utf-8', errors='replace')
+            case_results.append({
+                'case_id': case_file.stem,
+                'success': (
+                    run_result.status == CommandRunStatus.Finished and
+                    (run_result.return_code or 0) == 0
+                ),
+                'output': output_text,
+                'error': '' if (
+                    run_result.status == CommandRunStatus.Finished and
+                    (run_result.return_code or 0) == 0
+                ) else (run_result.stderr or ''),
+                'run_result': run_result,
+            })
+
+        return compile_result, case_results
