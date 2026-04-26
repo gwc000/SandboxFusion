@@ -40,6 +40,8 @@ from sandbox.utils.mounted_oj import (
     VERDICT_ERROR,
     judge_cases_from_disk,
     resolve_data_root,
+    resolve_generation_data_root,
+    run_program_from_disk,
 )
 from sandbox.utils.execution import max_concurrency
 
@@ -136,6 +138,53 @@ class RunMountedOJResponse(BaseModel):
     total_score: float = 0.0
     max_score: float = 0.0
     executor_pod_name: Optional[str] = None
+
+
+class RunMountedProgramRequest(BaseModel):
+    problem_id: str = Field(..., description='problem directory name under the mounted generation data root')
+    language: Literal['cpp', 'java', 'py3', 'python'] = Field(
+        'cpp', description='supported mounted execution languages: cpp, java, py3 (python alias accepted)'
+    )
+    code: Optional[str] = Field(None, description='inline code to compile and run')
+    source_path: Optional[str] = Field(
+        None,
+        description='relative source path under the problem directory when code is not provided',
+    )
+    problem_files: List[str] = Field(
+        default_factory=list,
+        description='additional relative files under the problem directory to copy into the sandbox workdir',
+    )
+    data_dir: Optional[str] = Field(
+        None,
+        description='optional override for the mounted generation data root; defaults to the generation root',
+    )
+    compile_timeout: float = Field(30, description='compile timeout in seconds')
+    run_timeout: float = Field(30, description='run timeout in seconds')
+    memory_limit_MB: Optional[int] = Field(None, description='optional override for problem.json memory_limit_mb')
+    stdin: Optional[str] = Field('', description='optional stdin string')
+    argv: List[str] = Field(default_factory=list, description='optional argv list passed to the program')
+    fetch_files: List[str] = Field(
+        default_factory=list,
+        description='relative files to fetch from the sandbox workdir after execution',
+    )
+    save_stdout_path: Optional[str] = Field(
+        None,
+        description='optional relative path under the problem directory where stdout should be persisted',
+    )
+    return_stdout: bool = Field(
+        False,
+        description='when false, suppress stdout in the response after optionally persisting it to disk',
+    )
+    enable_msvc_i64_compat: bool = Field(
+        False,
+        description='when true, rewrite legacy MSVC-style %I64* stdio format specifiers in cpp code',
+    )
+
+
+class RunMountedProgramResponse(RunCodeResponse):
+    problem_id: str
+    data_dir: str
+    saved_stdout_path: Optional[str] = None
 
 
 def _strip_case_details(case_results: List[MountedOJCaseResult]) -> List[MountedOJCaseResult]:
@@ -323,6 +372,69 @@ async def run_oj_cases(request: RunMountedOJRequest):
         raise
     except Exception as e:
         message = f'exception on mounted OJ request {request.problem_id}: {e} {traceback.print_tb(e.__traceback__)}'
+        logger.warning(message)
+        resp.message = message
+        resp.status = RunStatus.SandboxError
+
+    return resp
+
+
+@sandbox_router.post("/run_mounted_program", response_model=RunMountedProgramResponse, tags=['sandbox'])
+@max_concurrency(MOUNTED_OJ_MAX_CONCURRENCY)
+async def run_mounted_program(request: RunMountedProgramRequest):
+    resp = RunMountedProgramResponse(
+        status=RunStatus.Success,
+        message='',
+        problem_id=request.problem_id,
+        data_dir='',
+        executor_pod_name=os.environ.get('MY_POD_NAME'),
+    )
+    try:
+        data_root = resolve_generation_data_root(request.data_dir)
+        resp.data_dir = str(data_root)
+        logger.debug(
+            'start processing mounted program request',
+            problem_id=request.problem_id,
+            data_dir=resp.data_dir,
+            language=request.language,
+            source_path=request.source_path,
+            argv=request.argv,
+            fetch_files=request.fetch_files,
+        )
+        _, compile_result, run_result, files = await run_program_from_disk(
+            data_root=data_root,
+            problem_id=request.problem_id,
+            language=request.language,
+            compile_timeout=request.compile_timeout,
+            run_timeout=request.run_timeout,
+            memory_limit_mb=request.memory_limit_MB,
+            stdin=request.stdin,
+            argv=request.argv,
+            code=request.code,
+            source_path=request.source_path,
+            problem_files=request.problem_files,
+            fetch_files=request.fetch_files,
+            save_stdout_path=request.save_stdout_path,
+            return_stdout=request.return_stdout,
+            enable_msvc_i64_compat=request.enable_msvc_i64_compat,
+        )
+        resp.compile_result = compile_result
+        resp.run_result = run_result
+        resp.files = files
+        resp.saved_stdout_path = request.save_stdout_path
+        resp.status, message = parse_run_status(CodeRunResult(
+            compile_result=compile_result,
+            run_result=run_result,
+            files=files,
+        ))
+        if resp.status == RunStatus.SandboxError:
+            resp.message = message
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        message = f'exception on mounted program request {request.problem_id}: {e} {traceback.print_tb(e.__traceback__)}'
         logger.warning(message)
         resp.message = message
         resp.status = RunStatus.SandboxError

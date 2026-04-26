@@ -40,6 +40,9 @@ VERDICT_CHECKER_CE = 'CHECKER_CE'
 VERDICT_ERROR = 'ERROR'
 CPU_LIMIT_SIGNAL_RETURN_CODES = {-signal.SIGXCPU}
 SUPPORTED_MOUNTED_OJ_LANGUAGES = ('cpp', 'java', 'py3', 'python')
+DEFAULT_GENERATION_DATA_ROOT = Path(
+    os.getenv('OJ_GENERATION_DATA_ROOT', '/volume/lzchai/mounted_oj_cco_test_generation')
+).expanduser().resolve()
 
 
 class MountedOJCheckerSpec(BaseModel):
@@ -100,6 +103,13 @@ def resolve_data_root(data_dir: Optional[str]) -> Path:
     root_path = Path(root).expanduser().resolve()
     if not root_path.is_dir():
         raise ValueError(f'OJ data root does not exist or is not a directory: {root_path}')
+    return root_path
+
+
+def resolve_generation_data_root(data_dir: Optional[str]) -> Path:
+    root_path = Path(data_dir).expanduser().resolve() if data_dir else DEFAULT_GENERATION_DATA_ROOT
+    if not root_path.is_dir():
+        raise ValueError(f'generation data root does not exist or is not a directory: {root_path}')
     return root_path
 
 
@@ -186,9 +196,14 @@ async def _run_binary(binary_path: Path,
                       stdin_path: Path,
                       output_path: Path,
                       timeout: float,
-                      memory_limit_mb: int = -1, cpu_limit_s: Optional[int] = None) -> CommandRunResult:
+                      memory_limit_mb: int = -1,
+                      cpu_limit_s: Optional[int] = None,
+                      argv: Optional[List[str]] = None) -> CommandRunResult:
+    command = shlex.quote(str(binary_path))
+    if argv:
+        command = f"{command} {' '.join(shlex.quote(arg) for arg in argv)}"
     return await run_command_bare(
-        shlex.quote(str(binary_path)),
+        command,
         timeout=timeout,
         stdin_path=str(stdin_path),
         stdout_path=str(output_path),
@@ -314,9 +329,13 @@ async def _run_command_with_files(command: str,
                                   timeout: float,
                                   memory_limit_mb: int = -1,
                                   cpu_limit_s: Optional[int] = None,
-                                  extra_env: Optional[Dict[str, str]] = None) -> CommandRunResult:
+                                  extra_env: Optional[Dict[str, str]] = None,
+                                  argv: Optional[List[str]] = None) -> CommandRunResult:
+    full_command = command
+    if argv:
+        full_command = f"{full_command} {' '.join(shlex.quote(arg) for arg in argv)}"
     return await run_command_bare(
-        command,
+        full_command,
         timeout=timeout,
         stdin_path=str(stdin_path),
         stdout_path=str(output_path),
@@ -351,7 +370,8 @@ async def _prepare_solution_runner(language: str,
             return compile_result, None
 
         async def _runner(stdin_path: Path, output_path: Path, timeout: float,
-                          memory_limit_mb: int = -1, cpu_limit_s: Optional[int] = None) -> CommandRunResult:
+                          memory_limit_mb: int = -1, cpu_limit_s: Optional[int] = None,
+                          argv: Optional[List[str]] = None) -> CommandRunResult:
             return await _run_binary(
                 solution_bin,
                 work_dir,
@@ -360,6 +380,7 @@ async def _prepare_solution_runner(language: str,
                 timeout=timeout,
                 memory_limit_mb=memory_limit_mb,
                 cpu_limit_s=cpu_limit_s,
+                argv=argv,
             )
 
         return compile_result, _runner
@@ -384,7 +405,8 @@ async def _prepare_solution_runner(language: str,
             return compile_result, None
 
         async def _runner(stdin_path: Path, output_path: Path, timeout: float,
-                          memory_limit_mb: int = -1, cpu_limit_s: Optional[int] = None) -> CommandRunResult:
+                          memory_limit_mb: int = -1, cpu_limit_s: Optional[int] = None,
+                          argv: Optional[List[str]] = None) -> CommandRunResult:
             # For Java, rely on JVM flags rather than RLIMIT_AS / RLIMIT_DATA.
             # RLIMIT-based address-space caps are too strict for JVM startup on low-memory OJ problems.
             return await _run_command_with_files(
@@ -395,6 +417,7 @@ async def _prepare_solution_runner(language: str,
                 timeout=timeout,
                 memory_limit_mb=-1,
                 cpu_limit_s=cpu_limit_s,
+                argv=argv,
             )
 
         return compile_result, _runner
@@ -408,7 +431,8 @@ async def _prepare_solution_runner(language: str,
     python_command, python_extra_env = _get_python_runtime_command()
 
     async def _runner(stdin_path: Path, output_path: Path, timeout: float,
-                      memory_limit_mb: int = -1, cpu_limit_s: Optional[int] = None) -> CommandRunResult:
+                      memory_limit_mb: int = -1, cpu_limit_s: Optional[int] = None,
+                      argv: Optional[List[str]] = None) -> CommandRunResult:
         return await _run_command_with_files(
             f'{python_command} {shlex.quote(solution_src.name)}',
             work_dir,
@@ -418,6 +442,7 @@ async def _prepare_solution_runner(language: str,
             memory_limit_mb=memory_limit_mb,
             cpu_limit_s=cpu_limit_s,
             extra_env=python_extra_env,
+            argv=argv,
         )
 
     return compile_result, _runner
@@ -685,3 +710,97 @@ async def judge_cases_from_disk(
                 ))
 
         return problem, compile_result, checker_compile_result, case_results
+
+
+async def run_program_from_disk(
+    data_root: Path,
+    problem_id: str,
+    language: str,
+    compile_timeout: float,
+    run_timeout: float,
+    memory_limit_mb: Optional[int] = None,
+    stdin: Optional[str] = None,
+    argv: Optional[List[str]] = None,
+    code: Optional[str] = None,
+    source_path: Optional[str] = None,
+    problem_files: Optional[List[str]] = None,
+    fetch_files: Optional[List[str]] = None,
+    save_stdout_path: Optional[str] = None,
+    return_stdout: bool = False,
+    enable_msvc_i64_compat: bool = False,
+) -> tuple[MountedOJProblemSpec, Optional[CommandRunResult], Optional[CommandRunResult], Dict[str, str]]:
+    problem_dir, problem, _ = load_problem_spec(data_root, problem_id)
+    effective_memory_limit = problem.memory_limit_mb if memory_limit_mb is None else memory_limit_mb
+
+    source_code = code
+    additional_files = list(problem_files or [])
+    if source_code is None:
+        if not source_path:
+            raise ValueError('either code or source_path must be provided')
+        resolved_source = _resolve_under(problem_dir, source_path)
+        if not resolved_source.is_file():
+            raise FileNotFoundError(f'source file not found: {resolved_source}')
+        source_code = resolved_source.read_text(encoding='utf-8')
+        additional_files.append(source_path)
+
+    fetch_files = list(fetch_files or [])
+    for rel_path in additional_files + fetch_files:
+        _validate_identifier(rel_path.replace('/', '_').replace('\\', '_'), 'relative_path_guard')
+
+    save_stdout_resolved: Optional[Path] = None
+    if save_stdout_path:
+        save_stdout_resolved = _resolve_under(problem_dir, save_stdout_path)
+        save_stdout_resolved.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(dir=get_tmp_dir(), ignore_cleanup_errors=True) as tmp_dir_name:
+        work_dir = Path(tmp_dir_name)
+        _copy_problem_files(problem_dir, work_dir, problem.shared_files)
+        if additional_files:
+            _copy_problem_files(problem_dir, work_dir, additional_files)
+
+        compile_result, program_runner = await _prepare_solution_runner(
+            language=language,
+            code=source_code,
+            work_dir=work_dir,
+            compile_timeout=compile_timeout,
+            enable_msvc_i64_compat=enable_msvc_i64_compat,
+        )
+        if compile_result is not None and (
+            compile_result.status != CommandRunStatus.Finished or compile_result.return_code != 0
+        ):
+            return problem, compile_result, None, {}
+        if program_runner is None:
+            return problem, compile_result, None, {}
+
+        stdin_path = work_dir / 'stdin.txt'
+        output_path = work_dir / 'stdout.txt'
+        stdin_path.write_text(stdin or '', encoding='utf-8')
+        if output_path.exists():
+            output_path.unlink()
+
+        run_result = await program_runner(
+            stdin_path=stdin_path,
+            output_path=output_path,
+            timeout=run_timeout,
+            memory_limit_mb=effective_memory_limit,
+            cpu_limit_s=None,
+            argv=argv or [],
+        )
+
+        if (
+            save_stdout_resolved is not None and
+            output_path.is_file()
+        ):
+            save_stdout_resolved.write_bytes(output_path.read_bytes())
+
+        if run_result is not None and not return_stdout:
+            run_result = run_result.model_copy(update={'stdout': None})
+
+        encoded_files: Dict[str, str] = {}
+        for rel_path in fetch_files:
+            resolved = _resolve_under(work_dir, rel_path)
+            if not resolved.is_file():
+                continue
+            encoded_files[rel_path] = base64.b64encode(resolved.read_bytes()).decode('utf-8')
+
+        return problem, compile_result, run_result, encoded_files
