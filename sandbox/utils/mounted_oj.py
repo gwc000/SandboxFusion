@@ -904,7 +904,8 @@ async def run_solution_cases_from_dir(
     run_timeout: float,
     memory_limit_mb: int = -1,
     enable_msvc_i64_compat: bool = False,
-) -> tuple[Optional[CommandRunResult], List[Dict[str, object]]]:
+    solution_id: Optional[str] = None,
+) -> tuple[Optional[CommandRunResult], List[Dict[str, object]], str]:
     resolved_input_dir = resolve_generation_file_path(data_root, input_path, 'input_path')
     if not resolved_input_dir.is_dir():
         raise FileNotFoundError(f'input_path is not a directory: {resolved_input_dir}')
@@ -915,6 +916,13 @@ async def run_solution_cases_from_dir(
     )
     if not case_files:
         raise FileNotFoundError(f'no .in files found under input_path: {resolved_input_dir}')
+
+    output_dir: Optional[Path] = None
+    if solution_id:
+        safe_solution_id = _validate_identifier(solution_id, 'solution_id')
+        output_dir = resolved_input_dir.parent / 'solution_outputs' / safe_solution_id
+        shutil.rmtree(output_dir, ignore_errors=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(dir=get_tmp_dir(), ignore_cleanup_errors=True) as tmp_dir_name:
         work_dir = Path(tmp_dir_name)
@@ -928,9 +936,20 @@ async def run_solution_cases_from_dir(
         if compile_result is not None and (
             compile_result.status != CommandRunStatus.Finished or compile_result.return_code != 0
         ):
-            return compile_result, []
+            if output_dir:
+                manifest = {
+                    'success': False,
+                    'error': compile_result.stderr or 'solution compilation failed',
+                    'compile_result': compile_result.model_dump(mode='json'),
+                    'cases': [],
+                }
+                (output_dir / 'manifest.json').write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2) + '\n',
+                    encoding='utf-8',
+                )
+            return compile_result, [], str(output_dir) if output_dir else ''
         if solution_runner is None:
-            return compile_result, []
+            return compile_result, [], str(output_dir) if output_dir else ''
 
         case_results: List[Dict[str, object]] = []
         for case_file in case_files:
@@ -945,20 +964,54 @@ async def run_solution_cases_from_dir(
                 cpu_limit_s=None,
             )
             output_text = ''
+            output_size = 0
+            final_output_path = ''
             if output_path.is_file():
-                output_text = output_path.read_text(encoding='utf-8', errors='replace')
+                output_size = output_path.stat().st_size
+                if output_dir:
+                    final_path = output_dir / f'{case_file.stem}.out'
+                    shutil.copyfile(output_path, final_path)
+                    final_output_path = final_path.name
+                else:
+                    output_text = output_path.read_text(encoding='utf-8', errors='replace')
+            success = (
+                run_result.status == CommandRunStatus.Finished and
+                (run_result.return_code or 0) == 0
+            )
             case_results.append({
                 'case_id': case_file.stem,
-                'success': (
-                    run_result.status == CommandRunStatus.Finished and
-                    (run_result.return_code or 0) == 0
-                ),
+                'success': success,
                 'output': output_text,
-                'error': '' if (
-                    run_result.status == CommandRunStatus.Finished and
-                    (run_result.return_code or 0) == 0
-                ) else (run_result.stderr or ''),
+                'output_path': final_output_path,
+                'output_size': output_size,
+                'error': '' if success else (run_result.stderr or ''),
                 'run_result': run_result,
             })
 
-        return compile_result, case_results
+        if output_dir:
+            manifest_cases = []
+            for case_result in case_results:
+                run_result = case_result.get('run_result')
+                manifest_case = dict(case_result)
+                manifest_case['run_result'] = (
+                    run_result.model_dump(mode='json') if isinstance(run_result, CommandRunResult) else run_result
+                )
+                manifest_cases.append(manifest_case)
+            success = (
+                compile_result is not None and
+                compile_result.status == CommandRunStatus.Finished and
+                compile_result.return_code == 0 and
+                all(bool(case.get('success')) for case in case_results)
+            )
+            manifest = {
+                'success': success,
+                'error': '' if success else 'one or more solution cases failed',
+                'compile_result': compile_result.model_dump(mode='json') if compile_result is not None else None,
+                'cases': manifest_cases,
+            }
+            (output_dir / 'manifest.json').write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + '\n',
+                encoding='utf-8',
+            )
+
+        return compile_result, case_results, str(output_dir) if output_dir else ''

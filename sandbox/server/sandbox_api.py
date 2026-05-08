@@ -217,6 +217,8 @@ class RunSolutionCaseResponse(BaseModel):
     case_id: str
     success: bool
     output: str = ''
+    output_path: str = ''
+    output_size: int = 0
     error: str = ''
     run_result: Optional[CommandRunResult] = None
 
@@ -231,6 +233,10 @@ class RunSolutionRequest(BaseModel):
     run_timeout: float = Field(30, description='run timeout in seconds')
     memory_limit_MB: int = Field(-1, description='maximum memory allowed in megabytes')
     data_dir: Optional[str] = Field(None, description='optional override for the mounted generation data root')
+    solution_id: Optional[str] = Field(
+        None,
+        description='optional unique id for file-backed outputs under sibling solution_outputs/<solution_id>',
+    )
     enable_msvc_i64_compat: bool = Field(
         False,
         description='when true, rewrite legacy MSVC-style %I64* stdio format specifiers in cpp code',
@@ -242,6 +248,8 @@ class RunSolutionResponse(BaseModel):
     compile_result: Optional[CommandRunResult] = None
     cases: List[RunSolutionCaseResponse] = Field(default_factory=list)
     error: str = ''
+    solution_id: Optional[str] = None
+    output_dir: Optional[str] = None
     executor_pod_name: Optional[str] = None
 
 
@@ -501,7 +509,7 @@ async def run_solution(request: RunSolutionRequest):
     )
     try:
         data_root = resolve_generation_data_root(request.data_dir)
-        compile_result, case_results = await run_solution_cases_from_dir(
+        compile_result, case_results, output_dir = await run_solution_cases_from_dir(
             data_root=data_root,
             code=request.code,
             language=request.language,
@@ -510,17 +518,25 @@ async def run_solution(request: RunSolutionRequest):
             run_timeout=request.run_timeout,
             memory_limit_mb=request.memory_limit_MB,
             enable_msvc_i64_compat=request.enable_msvc_i64_compat,
+            solution_id=request.solution_id,
         )
-        resp.compile_result = compile_result
-        resp.cases = [RunSolutionCaseResponse(**case) for case in case_results]
+        resp.solution_id = request.solution_id
+        if request.solution_id:
+            resp.output_dir = output_dir
+        else:
+            resp.compile_result = compile_result
+            resp.cases = [RunSolutionCaseResponse(**case) for case in case_results]
         compile_ok = (
             compile_result is not None and
             compile_result.status == CommandRunStatus.Finished and
             compile_result.return_code == 0
         )
-        resp.success = bool(compile_ok)
+        cases_ok = all(bool(case.get('success')) for case in case_results)
+        resp.success = bool(compile_ok and cases_ok)
         if not compile_ok:
             resp.error = compile_result.stderr if compile_result is not None else 'solution compilation failed'
+        elif not cases_ok:
+            resp.error = 'one or more solution cases failed'
     except (ValueError, FileNotFoundError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
